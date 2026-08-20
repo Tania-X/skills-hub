@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""
+mcp-server-skills-hub — 能力中心 MCP 服务器
+
+把 skills-hub 仓库中的 skills 通过 MCP 协议暴露给任何 MCP 客户端。
+
+特性：
+- list_skills: 列出所有可用 skills（含描述）
+- get_skill: 获取 skill 的完整 SKILL.md + 元信息
+- install_skill: 安装到本地 Hermes skills 目录
+- refresh_cache: 重新同步仓库索引
+
+数据来源（按优先级）：
+1. 本地仓库副本（$SKILLS_HUB_LOCAL_REPO，若设置且存在）
+2. GitHub API（$SKILLS_HUB_REPO，走代理或直连，环境变量控制）
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------- 配置
+
+REPO = os.environ.get("SKILLS_HUB_REPO", "Tania-X/skills-hub")
+BRANCH = os.environ.get("SKILLS_HUB_BRANCH", "main")
+LOCAL_REPO = os.environ.get("SKILLS_HUB_LOCAL_REPO", "")  # 本地克隆路径（可选）
+CACHE_TTL = int(os.environ.get("SKILLS_HUB_CACHE_TTL", "300"))
+PROXY = os.environ.get("SKILLS_HUB_PROXY", "")  # 如 http://127.0.0.1:7890（可选）
+GITHUB_TOKEN = os.environ.get("SKILLS_HUB_TOKEN", os.environ.get("GITHUB_TOKEN", ""))
+
+
+def default_install_dir() -> str:
+    """Hermes skills 目录：$HERMES_HOME/skills，回退 ~/.hermes/skills"""
+    hh = os.environ.get("HERMES_HOME", "")
+    if hh:
+        return str(Path(hh) / "skills")
+    return str(Path.home() / ".hermes" / "skills")
+
+
+INSTALL_DIR = os.environ.get("SKILLS_HUB_INSTALL_DIR", default_install_dir())
+
+API_BASE = f"https://api.github.com/repos/{REPO}"
+RAW_BASE = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}"
+
+_cache: dict[str, Any] = {"skills": None, "fetched_at": 0.0}
+
+
+# ---------------------------------------------------------------- 数据获取
+
+def _gh_request(url: str, retries: int = 2) -> Any:
+    """GitHub API 请求（可选代理/Token）。失败自动重试 retries 次，仍失败抛异常。"""
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "mcp-server-skills-hub",
+                "Accept": "application/vnd.github+json",
+            })
+            if GITHUB_TOKEN:
+                req.add_header("Authorization", f"Bearer {GITHUB_TOKEN}")
+            opener = urllib.request.build_opener()
+            if PROXY:
+                proxy = urllib.request.ProxyHandler({
+                    "http": PROXY,
+                    "https": PROXY,
+                })
+                opener = urllib.request.build_opener(proxy)
+            with opener.open(req, timeout=45) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            if attempt < retries:
+                import time as _time
+                _time.sleep(2 * (attempt + 1))  # 2s, 4s 退避
+    raise RuntimeError(f"GitHub API 请求失败(重试 {retries} 次): {last_exc}") from last_exc
+
+
+def _local_skills() -> list[dict] | None:
+    """从本地仓库副本读 skills 索引。"""
+    if not LOCAL_REPO:
+        return None
+    skills_dir = Path(LOCAL_REPO) / "skills"
+    if not skills_dir.is_dir():
+        return None
+    result = []
+    for child in sorted(skills_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        skill_md = child / "SKILL.md"
+        if not skill_md.is_file():
+            continue
+        meta = _parse_frontmatter(skill_md.read_text(encoding="utf-8", errors="replace"))
+        result.append({
+            "name": child.name,
+            "description": meta.get("description", ""),
+            "version": meta.get("version", ""),
+            "source": "local",
+        })
+    return result or None
+
+
+def _remote_skills() -> list[dict]:
+    """从 GitHub API 拉 skills 目录。"""
+    items = _gh_request(f"{API_BASE}/contents/skills?ref={BRANCH}")
+    result = []
+    for item in items:
+        if item.get("type") != "dir":
+            continue
+        result.append({
+            "name": item["name"],
+            "description": "",
+            "version": "",
+            "source": "github",
+        })
+    return result
+
+
+def _fetch_skill_meta(name: str) -> dict:
+    """远程拉取单个 skill 的 SKILL.md 并解析 frontmatter。"""
+    text = _gh_request(f"{API_BASE}/contents/skills/{name}/SKILL.md?ref={BRANCH}")
+    import base64
+    content = base64.b64decode(text["content"]).decode("utf-8", errors="replace")
+    meta = _parse_frontmatter(content)
+    return {"name": name, **meta}
+
+
+def _parse_frontmatter(text: str) -> dict:
+    """解析 SKILL.md 的 YAML frontmatter（极简版，不引第三方 YAML 依赖）。"""
+    meta: dict[str, str] = {}
+    if not text.startswith("---"):
+        return meta
+    end = text.find("\n---", 4)
+    if end < 0:
+        return meta
+    block = text[4:end]
+    for line in block.splitlines():
+        if ":" in line:
+            key, _, value = line.partition(":")
+            meta[key.strip()] = value.strip().strip('"').strip("'")
+    return meta
+
+
+def get_skills_index(force: bool = False) -> list[dict]:
+    """获取 skills 索引（带缓存）。"""
+    now = time.time()
+    if not force and _cache["skills"] and (now - _cache["fetched_at"]) < CACHE_TTL:
+        return _cache["skills"]
+
+    skills = _local_skills()
+    if skills is None:
+        try:
+            skills = _remote_skills()
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"无法从仓库获取 skills 列表: {e}") from e
+
+    _cache["skills"] = skills
+    _cache["fetched_at"] = now
+    return skills
+
+
+def get_skill_content(name: str) -> dict:
+    """获取单个 skill 的完整内容。"""
+    # 1) 本地副本优先
+    if LOCAL_REPO:
+        p = Path(LOCAL_REPO) / "skills" / name / "SKILL.md"
+        if p.is_file():
+            text = p.read_text(encoding="utf-8", errors="replace")
+            meta = _parse_frontmatter(text)
+            return {"name": name, "content": text, "version": meta.get("version", ""), "source": "local"}
+    # 2) GitHub 兜底
+    try:
+        import base64
+        text = _gh_request(f"{API_BASE}/contents/skills/{name}/SKILL.md?ref={BRANCH}")
+        content = base64.b64decode(text["content"]).decode("utf-8", errors="replace")
+        meta = _parse_frontmatter(content)
+        return {"name": name, "content": content, "version": meta.get("version", ""), "source": "github"}
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"无法获取 skill '{name}': {e}") from e
+
+
+# ---------------------------------------------------------------- 依赖解析
+
+def _parse_deps(meta: dict) -> list[str]:
+    """从 frontmatter 元信息解析依赖 skill 列表。
+
+    来源（按优先级）：
+    1. metadata.hermes.related_skills（列表，Hermes 风格）
+    2. dependencies（列表，通用风格）
+    3. metadata.hermes.related_skills 字符串形式（逗号分隔）
+    """
+    deps: list[str] = []
+    hermes = meta.get("metadata.hermes", "")
+    related = ""
+    if isinstance(hermes, str) and hermes:
+        related = hermes  # 极简解析: 找 related_skills
+    raw = meta.get("dependencies", "") or meta.get("related_skills", "")
+    # metadata.hermes.related_skills 在极简 frontmatter 解析下会变成:
+    # meta["metadata.hermes"] = "{tags: [...], related_skills: [...]}" 的原始串
+    import re as _re
+    if isinstance(related, str) and "related_skills" in related:
+        m = _re.search(r"related_skills:\s*\[([^\]]*)\]", related)
+        if m:
+            raw = m.group(1)
+    if isinstance(raw, str) and raw:
+        deps = [d.strip().strip("'\"") for d in raw.replace("[", "").replace("]", "").split(",") if d.strip()]
+    elif isinstance(raw, list):
+        deps = [str(d).strip() for d in raw if str(d).strip()]
+    return [d for d in deps if d and d != "none"]
+
+
+def _install_one(name: str, force: bool) -> dict:
+    """安装单个 skill（无依赖），返回安装结果。"""
+    data = get_skill_content(name)
+    target = Path(INSTALL_DIR) / name
+    if target.exists() and not force:
+        return {
+            "name": name,
+            "status": "skipped",
+            "reason": f"已存在于 {target}（force=True 覆盖）",
+        }
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "SKILL.md").write_text(data["content"], encoding="utf-8")
+    return {
+        "name": name,
+        "status": "installed",
+        "installed_to": str(target),
+        "version": data.get("version", ""),
+    }
+
+
+def _install_with_deps(name: str, force: bool, with_deps: bool) -> dict:
+    """安装 skill 及其依赖（BFS，带 visited 防循环）。"""
+    installed: list[dict] = []
+    failed: list[str] = []
+    visited: set[str] = set()
+
+    def visit(n: str) -> None:
+        if n in visited:
+            return
+        visited.add(n)
+        try:
+            res = _install_one(n, force)
+            installed.append(res)
+            # 解析该 skill 的依赖（需重新拉元信息）
+            if with_deps and res.get("status") in ("installed", "skipped"):
+                try:
+                    data = get_skill_content(n)
+                    meta = _parse_frontmatter(data["content"])
+                    for dep in _parse_deps(meta):
+                        visit(dep)
+                except RuntimeError:
+                    pass  # 依赖解析失败不阻塞主安装
+        except RuntimeError as e:
+            failed.append(f"{n}: {e}")
+
+    visit(name)
+    return {
+        "ok": not failed,
+        "installed": installed,
+        "failed": failed,
+        "install_dir": str(Path(INSTALL_DIR)),
+    }
+
+
+# ---------------------------------------------------------------- MCP 工具
+
+def _make_mcp():
+    from fastmcp import FastMCP
+
+    mcp = FastMCP("skills-hub", instructions=(
+        "能力中心 MCP 服务器：管理可复用的 agent skills。"
+        "可用工具：list_skills 列出 skills；get_skill 读取内容；"
+        "install_skill 安装到本地 Hermes skills 目录。"
+    ))
+
+    @mcp.tool()
+    def list_skills() -> str:
+        """列出能力中心所有可用 skills 及其描述、版本。"""
+        try:
+            skills = get_skills_index()
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+        return json.dumps({"skills": skills}, ensure_ascii=False)
+
+    @mcp.tool()
+    def get_skill(name: str) -> str:
+        """获取指定 skill 的完整 SKILL.md 内容与元信息。
+
+        Args:
+            name: skill 名称，如 "pr-ai-review-loop"
+        """
+        try:
+            return json.dumps(get_skill_content(name), ensure_ascii=False)
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def install_skill(name: str, force: bool = False, with_deps: bool = True) -> str:
+        """安装 skill 到本地 Hermes skills 目录（$HERMES_HOME/skills/<name>/）。
+
+        Args:
+            name: skill 名称
+            force: 已存在时是否覆盖（默认 False）
+            with_deps: 是否递归安装依赖（frontmatter metadata.hermes.related_skills
+                       与自定义 dependencies 字段，默认 True）
+        """
+        try:
+            result = _install_with_deps(name, force=force, with_deps=with_deps)
+            return json.dumps(result, ensure_ascii=False)
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def refresh_cache() -> str:
+        """强制重新同步 skills 索引（本地副本或 GitHub）。"""
+        try:
+            skills = get_skills_index(force=True)
+            return json.dumps({"ok": True, "count": len(skills), "skills": skills}, ensure_ascii=False)
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    return mcp
+
+
+# ---------------------------------------------------------------- main
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="skills-hub MCP server")
+    parser.add_argument("--transport", choices=["stdio", "http"], default="stdio")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8910)
+    args = parser.parse_args()
+
+    mcp = _make_mcp()
+    if args.transport == "http":
+        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    else:
+        mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
