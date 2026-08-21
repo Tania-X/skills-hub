@@ -5,6 +5,7 @@ version: 1.0.0
 author: Hermes Agent + Tania-X
 license: MIT
 platforms: [windows, linux, macos]
+dependencies: [review-severity-policy]
 metadata:
   hermes:
     tags: [ai-review, code-review, methodology, github]
@@ -36,6 +37,8 @@ metadata:
 - `grep`：正则搜索（找引用/定义）
 - `ast_grep`：语法感知查询（函数定义/调用点）
 - `list_dir`：目录浏览
+
+> 工具名因 agent 而异（Hermes: read_file / grep / ast_grep / list_dir；Claude Code: Read / Grep / Glob / Bash），能力等价即可，不必拘泥名称。
 
 **使用纪律**：跨文件影响面确认（如被改函数被谁调用）时**必须**用工具查，不能只凭 diff 猜。
 

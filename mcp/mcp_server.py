@@ -7,8 +7,11 @@ mcp-server-skills-hub — 能力中心 MCP 服务器
 特性：
 - list_skills: 列出所有可用 skills（含描述）
 - get_skill: 获取 skill 的完整 SKILL.md + 元信息
-- install_skill: 安装到本地 Hermes skills 目录
+- install_skill: 安装到本地 skills 目录（Hermes / Claude Code，目录由 SKILLS_HUB_INSTALL_DIR 指定）
 - refresh_cache: 重新同步仓库索引
+
+安全：
+- skill 名称经白名单校验（防路径穿越 / URL 注入）
 
 数据来源（按优先级）：
 1. 本地仓库副本（$SKILLS_HUB_LOCAL_REPO，若设置且存在）
@@ -18,6 +21,7 @@ mcp-server-skills-hub — 能力中心 MCP 服务器
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -51,6 +55,20 @@ API_BASE = f"https://api.github.com/repos/{REPO}"
 RAW_BASE = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}"
 
 _cache: dict[str, Any] = {"skills": None, "fetched_at": 0.0}
+
+# ---------------------------------------------------------------- 名称校验
+
+# skill 名称白名单：字母/数字/点/下划线/连字符，且不能以 . 或 - 开头。
+# 防止 install_skill / get_skill 传入 "../xxx" 之类的名称造成路径穿越或 URL 注入。
+SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$", re.IGNORECASE)
+
+
+def _validate_skill_name(name: str) -> None:
+    """校验 skill 名称；非法时抛 RuntimeError（会被 MCP 工具转成 error JSON）。"""
+    if not isinstance(name, str) or not SKILL_NAME_RE.match(name):
+        raise RuntimeError(
+            f"非法 skill 名称: {name!r}（仅允许字母、数字、点、下划线、连字符，且不以 . 或 - 开头）"
+        )
 
 
 # ---------------------------------------------------------------- 数据获取
@@ -168,6 +186,7 @@ def get_skills_index(force: bool = False) -> list[dict]:
 
 def get_skill_content(name: str) -> dict:
     """获取单个 skill 的完整内容。"""
+    _validate_skill_name(name)
     # 1) 本地副本优先
     if LOCAL_REPO:
         p = Path(LOCAL_REPO) / "skills" / name / "SKILL.md"
@@ -189,35 +208,23 @@ def get_skill_content(name: str) -> dict:
 # ---------------------------------------------------------------- 依赖解析
 
 def _parse_deps(meta: dict) -> list[str]:
-    """从 frontmatter 元信息解析依赖 skill 列表。
+    """从 frontmatter 解析**硬依赖** skill 列表。
 
-    来源（按优先级）：
-    1. metadata.hermes.related_skills（列表，Hermes 风格）
-    2. dependencies（列表，通用风格）
-    3. metadata.hermes.related_skills 字符串形式（逗号分隔）
+    仅顶层 `dependencies` 字段（列表或逗号分隔字符串）会被安装器递归安装；
+    `related_skills` 只作关联提示（相关 ≠ 依赖），**不安装、缺失不阻塞**。
     """
+    raw = meta.get("dependencies", "")
     deps: list[str] = []
-    hermes = meta.get("metadata.hermes", "")
-    related = ""
-    if isinstance(hermes, str) and hermes:
-        related = hermes  # 极简解析: 找 related_skills
-    raw = meta.get("dependencies", "") or meta.get("related_skills", "")
-    # metadata.hermes.related_skills 在极简 frontmatter 解析下会变成:
-    # meta["metadata.hermes"] = "{tags: [...], related_skills: [...]}" 的原始串
-    import re as _re
-    if isinstance(related, str) and "related_skills" in related:
-        m = _re.search(r"related_skills:\s*\[([^\]]*)\]", related)
-        if m:
-            raw = m.group(1)
-    if isinstance(raw, str) and raw:
-        deps = [d.strip().strip("'\"") for d in raw.replace("[", "").replace("]", "").split(",") if d.strip()]
-    elif isinstance(raw, list):
-        deps = [str(d).strip() for d in raw if str(d).strip()]
+    if isinstance(raw, list):
+        deps = [str(d).strip() for d in raw]
+    elif isinstance(raw, str) and raw.strip():
+        deps = [d.strip().strip("'\"") for d in raw.replace("[", "").replace("]", "").split(",")]
     return [d for d in deps if d and d != "none"]
 
 
 def _install_one(name: str, force: bool) -> dict:
     """安装单个 skill（无依赖），返回安装结果。"""
+    _validate_skill_name(name)
     data = get_skill_content(name)
     target = Path(INSTALL_DIR) / name
     if target.exists() and not force:
@@ -276,9 +283,10 @@ def _make_mcp():
     from fastmcp import FastMCP
 
     mcp = FastMCP("skills-hub", instructions=(
-        "能力中心 MCP 服务器：管理可复用的 agent skills。"
+        "能力中心 MCP 服务器：管理可复用的 agent skills（Hermes / Claude Code 等）。"
         "可用工具：list_skills 列出 skills；get_skill 读取内容；"
-        "install_skill 安装到本地 Hermes skills 目录。"
+        "install_skill 安装到本地 skills 目录（目录由 SKILLS_HUB_INSTALL_DIR 指定，"
+        "Hermes 默认 $HERMES_HOME/skills，Claude Code 设为 ~/.claude/skills）。"
     ))
 
     @mcp.tool()
@@ -304,13 +312,14 @@ def _make_mcp():
 
     @mcp.tool()
     def install_skill(name: str, force: bool = False, with_deps: bool = True) -> str:
-        """安装 skill 到本地 Hermes skills 目录（$HERMES_HOME/skills/<name>/）。
+        """安装 skill 到本地 skills 目录（目录由环境变量 SKILLS_HUB_INSTALL_DIR 指定：
+        Hermes 默认 $HERMES_HOME/skills，Claude Code 设为 ~/.claude/skills 或项目 .claude/skills）。
 
         Args:
-            name: skill 名称
+            name: skill 名称（仅字母/数字/点/下划线/连字符）
             force: 已存在时是否覆盖（默认 False）
-            with_deps: 是否递归安装依赖（frontmatter metadata.hermes.related_skills
-                       与自定义 dependencies 字段，默认 True）
+            with_deps: 是否递归安装 frontmatter `dependencies` 声明的硬依赖（默认 True；
+                       `related_skills` 仅提示、不安装）
         """
         try:
             result = _install_with_deps(name, force=force, with_deps=with_deps)

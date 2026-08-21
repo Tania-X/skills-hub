@@ -54,6 +54,7 @@ async def main() -> None:
                     )
                     data = json.loads(r.content[0].text)
                     print(f"ok={data.get('ok')} installed={[i['name'] for i in data.get('installed', [])]}")
+                    assert data.get("ok") is True, f"install 报告失败: {data.get('failed')}"
                     names = {i["name"] for i in data.get("installed", [])}
                     assert "pr-ai-review-loop" in names
                     assert "ai-review-method" in names, f"依赖未安装: {names}"
@@ -62,7 +63,11 @@ async def main() -> None:
                     for n in names:
                         p = os.path.join(tmpdir, n, "SKILL.md")
                         assert os.path.isfile(p), f"缺少文件: {p}"
-                    print("✅ 依赖解析验证通过 (loop + method + severity-policy 全装)")
+                    print("✅ 依赖解析验证通过 (loop + method + severity-policy 全装, ok=True)")
+
+            print("\n=== install_skill(路径穿越名称) — 期望 error（白名单校验）===")
+            r = await session.call_tool("install_skill", {"name": "../../evil"})
+            print(r.content[0].text[:150])
 
             print("\n=== refresh_cache ===")
             r = await session.call_tool("refresh_cache", {})

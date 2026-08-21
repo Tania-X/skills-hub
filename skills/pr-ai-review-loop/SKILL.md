@@ -5,6 +5,7 @@ version: 3.0.0
 author: Hermes Agent + Tania-X
 license: MIT
 platforms: [windows, linux, macos]
+dependencies: [ai-review-method, review-severity-policy]
 metadata:
   hermes:
     tags: [github, pr, ci, ai-review, workflow, loop, multi-agent]
@@ -59,7 +60,7 @@ metadata:
 
 ```yaml
 coder:
-  role: "当前 agent（Hermes）"
+  role: "当前执行 agent（Hermes / Claude Code / 任意支持 SKILL.md 的 agent）"
   mode: "interactive"          # interactive | headless（见下）
   style: "遵循项目规范（AGENTS.md / 代码风格）；最小改动原则；改完必须本地验证"
   constraints:
@@ -88,7 +89,7 @@ reviewer:
   context: "按 ai-review-method 的 §二 收集（约定文件 + 代码工具）"
 ```
 
-**插拔方式**：provider 可换（ai-tools action / 其他评审服务 / 自定义 review skill）。换成 skill 时：`skill_view` 加载对应 skill 后按其流程执行。
+**插拔方式**：provider 可换（ai-tools action / 其他评审服务 / 自定义 review skill）。换成 skill 时：加载对应 skill 后按其流程执行（Hermes: `skill_view`；Claude Code: skill 在 `~/.claude/skills` 自动发现，按需引用其内容）。
 
 ### Judge（默认 = 质量门裁决，新增角色）
 
@@ -199,7 +200,7 @@ curl.exe -s -H "Authorization: token $token" "https://api.github.com/repos/<owne
 ```
 
 **Reviewer 执行**：拿到 diff 后，按配置的 provider 执行评审：
-- 默认：加载 `ai-review-method` skill（`skill_view`），按其流程执行（上下文收集 → agentic 代码访问 → 两轴严重度 → 输出 issues JSON）
+- 默认：加载 `ai-review-method` skill（Hermes: `skill_view`；Claude Code: 自动发现于 skills 目录），按其流程执行（上下文收集 → agentic 代码访问 → 两轴严重度 → 输出 issues JSON）
 - 若 provider = ai-tools action：等 GitHub Actions 的评审评论出现即可
 
 ## Judge 裁决（状态 4）
