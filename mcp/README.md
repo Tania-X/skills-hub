@@ -45,7 +45,7 @@ mcp_servers:
 
 # 方式 3：Claude Code 注册（install_skill 会装到 ~/.claude/skills）
 claude mcp add skills-hub --env SKILLS_HUB_INSTALL_DIR="$HOME/.claude/skills" -- python C:/Users/001/skills-hub/mcp/mcp_server.py
-# 更完整的安装方式见 ../claude/README.md
+# 两种客户端的完整接入方式（方案 A/B/C 对照）见 ../hermes/README.md 与 ../claude/README.md
 ```
 
 ### HTTP（远程共享）

@@ -7,36 +7,25 @@
 ```
 skills/<skill-name>/SKILL.md   # 存储层：跨 agent 标准 skill 格式
 mcp/                           # 门面层：MCP 服务器（任意 MCP 客户端可用）
+hermes/                        # Hermes 客户端：安装脚本 + 使用文档
 claude/                        # Claude Code 客户端：安装脚本 + 使用文档
 ```
 
-## 安装到 Hermes
+## 客户端（每个 agent 一个平级目录，结构对等）
+
+| 客户端 | 目录 | 方案 A（注册即装） | 方案 B（复制安装） | 方案 C（MCP） |
+|--------|------|-------------------|-------------------|--------------|
+| Hermes | [hermes/](hermes/README.md) | `hermes skills tap add` | `hermes/install.ps1` / `install.sh` | config.yaml 手写 |
+| Claude Code | [claude/](claude/README.md) | 无对等命令（脚本或 plugin marketplace） | `claude/install.ps1` / `install.sh` | `claude mcp add skills-hub` |
 
 ```bash
-# 方案 A：作为 skill 源（tap）
-hermes skills tap add https://github.com/Tania-X/skills-hub
-hermes skills install pr-ai-review-loop
-
-# 方案 B：手动复制
-git clone https://github.com/Tania-X/skills-hub.git
-# 把 skills/<name> 目录复制到 $HERMES_HOME/skills/ 下
+# Hermes
+powershell -ExecutionPolicy Bypass -File hermes/install.ps1   # Windows；Linux 用 bash hermes/install.sh
+# Claude Code
+powershell -ExecutionPolicy Bypass -File claude/install.ps1   # Windows；Linux 用 bash claude/install.sh
 ```
 
-## 安装到 Claude Code
-
-Claude Code 原生支持 SKILL.md（`~/.claude/skills/<name>/SKILL.md` 启动时自动发现），
-本仓库 skills 可直接复用，功能与 Hermes 完全对等：
-
-```bash
-# 方案 B（推荐）：一键安装到 ~/.claude/skills
-powershell -ExecutionPolicy Bypass -File claude/install.ps1   # Windows
-bash claude/install.sh                                        # macOS / Linux
-
-# 方案 C：注册 MCP（install_skill 写入 ~/.claude/skills）
-claude/install.ps1 -RegisterMcp   # 或见 claude/README.md 手动命令
-```
-
-详见 [claude/README.md](claude/README.md)。
+详细用法见 [hermes/README.md](hermes/README.md) 与 [claude/README.md](claude/README.md)。
 
 ## 通过 MCP 使用（方案 C）
 
