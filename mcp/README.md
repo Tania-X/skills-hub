@@ -69,7 +69,7 @@ mcp_servers:
 | `SKILLS_HUB_BRANCH` | `main` | 拉取的分支 |
 | `SKILLS_HUB_LOCAL_REPO` | 空 | 本地克隆路径（可选，优先于 GitHub API，便于离线/省配额） |
 | `SKILLS_HUB_INSTALL_DIR` | `$HERMES_HOME/skills`（回退 `~/.hermes/skills`） | install_skill 的目标目录。**Claude Code 场景设为 `~/.claude/skills`（个人）或 `<项目>/.claude/skills`（项目级）** |
-| `SKILLS_HUB_CACHE_TTL` | `300` | 索引缓存秒数 |
+| `SKILLS_HUB_CACHE_TTL` | `300` | 索引与内容缓存秒数（`refresh_cache` 同时清空两者；`install_skill` 始终拉取最新内容） |
 | `SKILLS_HUB_PROXY` | 空 | GitHub API 代理，如 `http://127.0.0.1:7890` |
 | `SKILLS_HUB_TOKEN` / `GITHUB_TOKEN` | 空 | GitHub API Token（提高限流配额） |
 

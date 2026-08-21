@@ -1,0 +1,6 @@
+# mcp-server-skills-hub 依赖
+#
+# ⚠️ Hermes 0.19 兼容 mcp==1.26.x；mcp 2.x 改了 API 名（streamable_http_client），
+#    Hermes 会报 "streamable_http is not available"。其他 MCP 客户端（如 Claude Code）无此限制。
+mcp>=1.26,<2
+fastmcp>=2

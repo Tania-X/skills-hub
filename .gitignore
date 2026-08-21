@@ -11,3 +11,5 @@ venv/
 Thumbs.db
 
 .git.bak-*
+
+# 本地测试临时目录.tmp-*

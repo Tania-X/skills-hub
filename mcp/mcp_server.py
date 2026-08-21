@@ -54,7 +54,12 @@ INSTALL_DIR = os.environ.get("SKILLS_HUB_INSTALL_DIR", default_install_dir())
 API_BASE = f"https://api.github.com/repos/{REPO}"
 RAW_BASE = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}"
 
-_cache: dict[str, Any] = {"skills": None, "fetched_at": 0.0}
+_cache: dict[str, Any] = {
+    "skills": None,              # 索引缓存（list_skills）
+    "fetched_at": 0.0,
+    "contents": {},              # 内容缓存（get_skill，按 name）
+    "contents_fetched_at": {},   # 各条内容的缓存时间
+}
 
 # ---------------------------------------------------------------- 名称校验
 
@@ -167,8 +172,11 @@ def _parse_frontmatter(text: str) -> dict:
 
 
 def get_skills_index(force: bool = False) -> list[dict]:
-    """获取 skills 索引（带缓存）。"""
+    """获取 skills 索引（带缓存）。force=True 时同时清空内容缓存。"""
     now = time.time()
+    if force:
+        _cache["contents"].clear()
+        _cache["contents_fetched_at"].clear()
     if not force and _cache["skills"] and (now - _cache["fetched_at"]) < CACHE_TTL:
         return _cache["skills"]
 
@@ -184,23 +192,34 @@ def get_skills_index(force: bool = False) -> list[dict]:
     return skills
 
 
-def get_skill_content(name: str) -> dict:
-    """获取单个 skill 的完整内容。"""
+def get_skill_content(name: str, force: bool = False) -> dict:
+    """获取单个 skill 的完整内容（带 TTL 缓存；force=True 强制重新拉取并回写缓存）。"""
     _validate_skill_name(name)
+    now = time.time()
+    if not force:
+        cached = _cache["contents"].get(name)
+        if cached and (now - _cache["contents_fetched_at"].get(name, 0.0)) < CACHE_TTL:
+            return cached
     # 1) 本地副本优先
     if LOCAL_REPO:
         p = Path(LOCAL_REPO) / "skills" / name / "SKILL.md"
         if p.is_file():
             text = p.read_text(encoding="utf-8", errors="replace")
             meta = _parse_frontmatter(text)
-            return {"name": name, "content": text, "version": meta.get("version", ""), "source": "local"}
+            result = {"name": name, "content": text, "version": meta.get("version", ""), "source": "local"}
+            _cache["contents"][name] = result
+            _cache["contents_fetched_at"][name] = now
+            return result
     # 2) GitHub 兜底
     try:
         import base64
         text = _gh_request(f"{API_BASE}/contents/skills/{name}/SKILL.md?ref={BRANCH}")
         content = base64.b64decode(text["content"]).decode("utf-8", errors="replace")
         meta = _parse_frontmatter(content)
-        return {"name": name, "content": content, "version": meta.get("version", ""), "source": "github"}
+        result = {"name": name, "content": content, "version": meta.get("version", ""), "source": "github"}
+        _cache["contents"][name] = result
+        _cache["contents_fetched_at"][name] = now
+        return result
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"无法获取 skill '{name}': {e}") from e
 
@@ -223,9 +242,9 @@ def _parse_deps(meta: dict) -> list[str]:
 
 
 def _install_one(name: str, force: bool) -> dict:
-    """安装单个 skill（无依赖），返回安装结果。"""
+    """安装单个 skill（无依赖），返回安装结果。force=True 保证安装时拉取最新内容。"""
     _validate_skill_name(name)
-    data = get_skill_content(name)
+    data = get_skill_content(name, force=True)
     target = Path(INSTALL_DIR) / name
     if target.exists() and not force:
         return {
