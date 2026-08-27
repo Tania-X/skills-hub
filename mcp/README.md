@@ -1,7 +1,10 @@
 # mcp-server-skills-hub
 
 能力中心 MCP 服务器（方案 C 门面层）：把 [skills-hub](https://github.com/Tania-X/skills-hub) 仓库中的
-skills 通过 MCP 协议暴露给任何支持 MCP 的 agent（Hermes / Claude Code / Codex 等）。
+skills 通过 MCP 协议暴露给任何支持 MCP 的 agent（Hermes / Claude Code / Codex / Coze / Dify 等）。
+
+> **各客户端接入手册（含 Dify 1.17 踩坑）见 [CLIENT-INTEGRATIONS.md](CLIENT-INTEGRATIONS.md)**。
+> **凭据约定**：服务器 IP/端口/用户名/密码在文档中以占位符出现，实际值见本地 `cloud-services.md`（勿提交公开仓库）。
 
 ## 功能
 
