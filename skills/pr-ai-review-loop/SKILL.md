@@ -115,6 +115,9 @@ judge:
 4. 发起 PR 后**主动监听** CI 与 AI review 结果，不要等用户来问。
 5. **三角色不越权**：Coder 不裁决、Reviewer 不修改、Judge 不实现。
 6. **循环硬上限 3 轮**（含首轮）：第 3 轮后强制停止，转人工介入（interactive 等用户 / headless 返回调用方）。
+7. **禁止直接 push main**：所有开发必须走 `feat/*` 分支 + PR。
+8. **feat/* 分支合并后永不删除**：保留完整分支历史，便于回溯和继续演进。
+9. **PR 合并使用普通 merge（merge commit），不使用 squash merge**：保留每条 commit 历史。
 
 ## 前置检查
 
