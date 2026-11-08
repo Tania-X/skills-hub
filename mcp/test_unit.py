@@ -202,6 +202,87 @@ class TestHTTPAuthMiddleware:
 
 
 # ----------------------------------------------------------------
+# Changelog / 版本管理测试
+# ----------------------------------------------------------------
+
+class TestParseChangelog:
+    """测试 CHANGELOG.md 解析"""
+
+    def test_parse_simple_changelog(self):
+        from mcp_server import _parse_changelog
+        text = """# Changelog
+
+## v1.0.0 - 2024-01-15
+### 新增
+- 初始版本
+- 支持基本功能
+
+## v1.1.0 - 2024-02-20
+### 新增
+- 加了新功能A
+### 修复
+- 修复了Bug B
+"""
+        versions = _parse_changelog(text)
+        assert len(versions) == 2
+
+        # 第一个版本（最新的）
+        v1 = versions[0]
+        assert v1["version"] == "1.0.0"
+        assert v1["date"] == "2024-01-15"
+        assert len(v1["changes"]) == 2
+        assert "初始版本" in v1["changes"][0]
+
+        # 第二个版本
+        v2 = versions[1]
+        assert v2["version"] == "1.1.0"
+        assert v2["date"] == "2024-02-20"
+
+    def test_parse_empty_changelog(self):
+        from mcp_server import _parse_changelog
+        text = "# Changelog\n\n还没有版本记录。"
+        versions = _parse_changelog(text)
+        assert versions == []
+
+    def test_parse_changelog_without_date(self):
+        from mcp_server import _parse_changelog
+        text = """## v2.0.0
+- 重大更新
+"""
+        versions = _parse_changelog(text)
+        assert len(versions) == 1
+        assert versions[0]["version"] == "2.0.0"
+        assert versions[0]["date"] == ""
+
+
+class TestGetSkillChangelog:
+    """测试获取 skill changelog 的逻辑"""
+
+    def test_get_changelog_from_local(self, tmp_path):
+        from mcp_server import _get_skill_changelog
+        # 准备本地changelog文件
+        skill_dir = tmp_path / "skills" / "test-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "CHANGELOG.md").write_text(
+            "## v1.0.0 - 2024-01-01\n- 初始版本\n",
+            encoding="utf-8",
+        )
+        with patch("mcp_server.LOCAL_REPO", str(tmp_path)):
+            data = _get_skill_changelog("test-skill")
+            assert data["source"] == "local"
+            assert data["name"] == "test-skill"
+            assert len(data["versions"]) == 1
+            assert data["versions"][0]["version"] == "1.0.0"
+
+    def test_get_changelog_not_found(self, tmp_path):
+        from mcp_server import _get_skill_changelog
+        with patch("mcp_server.LOCAL_REPO", str(tmp_path)):
+            data = _get_skill_changelog("no-such-skill")
+            assert data["source"] == "none"
+            assert data["versions"] == []
+
+
+# ----------------------------------------------------------------
 # 运行入口
 # ----------------------------------------------------------------
 
