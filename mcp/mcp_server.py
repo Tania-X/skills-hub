@@ -450,11 +450,14 @@ def main() -> None:
         # 获取 MCP 的 ASGI 应用
         mcp_app = mcp.http_app(transport="streamable-http")
 
-        # 组合 Starlette 应用
-        app = Starlette(routes=[
-            Route("/health", health_endpoint),
-            Mount("/", app=mcp_app),
-        ])
+        # 组合 Starlette 应用（注意：必须传入 mcp_app.lifespan）
+        app = Starlette(
+            routes=[
+                Route("/health", health_endpoint),
+                Mount("/", app=mcp_app),
+            ],
+            lifespan=mcp_app.lifespan,
+        )
         app.add_middleware(APIKeyMiddleware)
 
         # 启动服务
