@@ -4,3 +4,4 @@
 #    Hermes 会报 "streamable_http is not available"。其他 MCP 客户端（如 Claude Code）无此限制。
 mcp>=1.26,<2
 fastmcp>=2
+uvicorn>=0.30  # HTTP 模式启动服务用

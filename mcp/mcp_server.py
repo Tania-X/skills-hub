@@ -39,6 +39,7 @@ LOCAL_REPO = os.environ.get("SKILLS_HUB_LOCAL_REPO", "")  # 本地克隆路径�
 CACHE_TTL = int(os.environ.get("SKILLS_HUB_CACHE_TTL", "300"))
 PROXY = os.environ.get("SKILLS_HUB_PROXY", "")  # 如 http://127.0.0.1:7890（可选）
 GITHUB_TOKEN = os.environ.get("SKILLS_HUB_TOKEN", os.environ.get("GITHUB_TOKEN", ""))
+API_KEY = os.environ.get("SKILLS_HUB_API_KEY", "")  # HTTP模式认证（可选，设置后客户端需带 Authorization: Bearer xxx）
 
 
 def default_install_dir() -> str:
@@ -298,21 +299,41 @@ def _install_with_deps(name: str, force: bool, with_deps: bool) -> dict:
 
 # ---------------------------------------------------------------- MCP 工具
 
+def _get_local_installed_version(name: str) -> str:
+    """读取本地已安装 skill 的版本号（从 SKILL.md frontmatter 解析）。"""
+    target = Path(INSTALL_DIR) / name / "SKILL.md"
+    if not target.is_file():
+        return ""
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+        meta = _parse_frontmatter(text)
+        return meta.get("version", "")
+    except Exception:
+        return ""
+
+
 def _make_mcp():
     from fastmcp import FastMCP
 
     mcp = FastMCP("skills-hub", instructions=(
         "能力中心 MCP 服务器：管理可复用的 agent skills（Hermes / Claude Code 等）。"
-        "可用工具：list_skills 列出 skills；get_skill 读取内容；"
-        "install_skill 安装到本地 skills 目录（目录由 SKILLS_HUB_INSTALL_DIR 指定，"
-        "Hermes 默认 $HERMES_HOME/skills，Claude Code 设为 ~/.claude/skills）。"
+        "可用工具：list_skills 列出 skills（含本地已安装版本）；get_skill 读取内容；"
+        "install_skill 安装到本地 skills 目录；upgrade_skill 升级到最新版本；"
+        "refresh_cache 重新同步索引。"
     ))
 
     @mcp.tool()
     def list_skills() -> str:
-        """列出能力中心所有可用 skills 及其描述、版本。"""
+        """列出能力中心所有可用 skills 及其描述、远程版本、本地已安装版本。"""
         try:
             skills = get_skills_index()
+            # 补充本地已安装版本
+            for s in skills:
+                local_ver = _get_local_installed_version(s["name"])
+                s["local_version"] = local_ver
+                s["upgradable"] = bool(
+                    local_ver and s.get("version") and s["version"] != local_ver
+                )
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
         return json.dumps({"skills": skills}, ensure_ascii=False)
@@ -355,6 +376,29 @@ def _make_mcp():
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
 
+    @mcp.tool()
+    def upgrade_skill(name: str, with_deps: bool = True) -> str:
+        """升级已安装的 skill 到最新版本（强制重新拉取并覆盖本地）。
+
+        Args:
+            name: skill 名称
+            with_deps: 是否同时升级依赖（默认 True）
+        """
+        try:
+            local_ver = _get_local_installed_version(name)
+            result = _install_with_deps(name, force=True, with_deps=with_deps)
+            result["previous_version"] = local_ver
+            result["current_version"] = ""
+            # 获取最新版本号
+            try:
+                data = get_skill_content(name, force=True)
+                result["current_version"] = data.get("version", "")
+            except RuntimeError:
+                pass
+            return json.dumps(result, ensure_ascii=False)
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
     return mcp
 
 
@@ -369,7 +413,56 @@ def main() -> None:
 
     mcp = _make_mcp()
     if args.transport == "http":
-        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+        # HTTP 模式：加认证中间件 + 健康检查端点
+        import asyncio
+        from starlette.applications import Starlette
+        from starlette.responses import JSONResponse
+        from starlette.routing import Route, Mount
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.requests import Request
+
+        # API Key 认证中间件
+        class APIKeyMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request: Request, call_next):
+                # 健康检查端点不需要认证
+                if request.url.path == "/health":
+                    return await call_next(request)
+                # 如果设置了 API Key，校验请求头
+                if API_KEY:
+                    auth = request.headers.get("authorization", "")
+                    if not auth.startswith("Bearer ") or auth[7:] != API_KEY:
+                        return JSONResponse(
+                            {"error": "unauthorized", "detail": "Invalid or missing API key"},
+                            status_code=401,
+                        )
+                return await call_next(request)
+
+        # 健康检查端点
+        async def health_endpoint(request: Request):
+            return JSONResponse({
+                "status": "ok",
+                "service": "skills-hub-mcp",
+                "auth_enabled": bool(API_KEY),
+                "repo": REPO,
+                "branch": BRANCH,
+            })
+
+        # 获取 MCP 的 ASGI 应用
+        mcp_app = mcp.http_app(transport="streamable-http")
+
+        # 组合 Starlette 应用（注意：必须传入 mcp_app.lifespan）
+        app = Starlette(
+            routes=[
+                Route("/health", health_endpoint),
+                Mount("/", app=mcp_app),
+            ],
+            lifespan=mcp_app.lifespan,
+        )
+        app.add_middleware(APIKeyMiddleware)
+
+        # 启动服务
+        import uvicorn
+        uvicorn.run(app, host=args.host, port=args.port)
     else:
         mcp.run(transport="stdio")
 
