@@ -172,6 +172,78 @@ def _parse_frontmatter(text: str) -> dict:
     return meta
 
 
+def _parse_changelog(text: str) -> list[dict]:
+    """解析 CHANGELOG.md，返回版本历史列表（按时间倒序）。
+
+    格式约定：
+    ## v1.2.3 - 2024-01-15
+    ### 新增
+    - xxx
+    ### 修复
+    - yyy
+    """
+    versions: list[dict] = []
+    current: dict | None = None
+
+    for line in text.splitlines():
+        line = line.strip()
+        # 匹配版本标题：## v1.2.3 - 2024-01-15
+        if line.startswith("## "):
+            if current:
+                versions.append(current)
+            # 解析版本号和日期
+            header = line[3:].strip()
+            parts = header.split(" - ", 1)
+            version = parts[0].strip().lstrip("vV")
+            date = parts[1].strip() if len(parts) > 1 else ""
+            current = {"version": version, "date": date, "changes": []}
+        # 匹配变更条目：- xxx
+        elif current and line.startswith("- "):
+            current["changes"].append(line[2:].strip())
+
+    if current:
+        versions.append(current)
+
+    return versions
+
+
+def _get_skill_changelog(name: str) -> dict:
+    """获取某个 skill 的 CHANGELOG.md 内容和解析后的版本历史。"""
+    _validate_skill_name(name)
+
+    # 1) 本地副本优先
+    if LOCAL_REPO:
+        p = Path(LOCAL_REPO) / "skills" / name / "CHANGELOG.md"
+        if p.is_file():
+            text = p.read_text(encoding="utf-8", errors="replace")
+            return {
+                "name": name,
+                "content": text,
+                "versions": _parse_changelog(text),
+                "source": "local",
+            }
+
+    # 2) GitHub 兜底
+    try:
+        import base64
+        text = _gh_request(f"{API_BASE}/contents/skills/{name}/CHANGELOG.md?ref={BRANCH}")
+        content = base64.b64decode(text["content"]).decode("utf-8", errors="replace")
+        return {
+            "name": name,
+            "content": content,
+            "versions": _parse_changelog(content),
+            "source": "github",
+        }
+    except Exception as e:  # noqa: BLE001
+        return {
+            "name": name,
+            "content": "",
+            "versions": [],
+            "source": "none",
+            "message": f"该 skill 没有 CHANGELOG.md: {e}",
+        }
+
+
 def get_skills_index(force: bool = False) -> list[dict]:
     """获取 skills 索引（带缓存）。force=True 时同时清空内容缓存。"""
     now = time.time()
@@ -318,6 +390,7 @@ def _make_mcp():
     mcp = FastMCP("skills-hub", instructions=(
         "能力中心 MCP 服务器：管理可复用的 agent skills（Hermes / Claude Code 等）。"
         "可用工具：list_skills 列出 skills（含本地已安装版本）；get_skill 读取内容；"
+        "get_skill_changelog 查看版本历史；list_skill_versions 列出所有版本；"
         "install_skill 安装到本地 skills 目录；upgrade_skill 升级到最新版本；"
         "refresh_cache 重新同步索引。"
     ))
@@ -396,6 +469,38 @@ def _make_mcp():
             except RuntimeError:
                 pass
             return json.dumps(result, ensure_ascii=False)
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def get_skill_changelog(name: str) -> str:
+        """获取某个 skill 的 CHANGELOG.md 内容和解析后的版本历史。
+
+        Args:
+            name: skill 名称
+        """
+        try:
+            data = _get_skill_changelog(name)
+            return json.dumps(data, ensure_ascii=False)
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def list_skill_versions(name: str) -> str:
+        """列出某个 skill 的所有历史版本（从 CHANGELOG.md 解析）。
+
+        Args:
+            name: skill 名称
+        """
+        try:
+            data = _get_skill_changelog(name)
+            versions = data.get("versions", [])
+            return json.dumps({
+                "name": name,
+                "count": len(versions),
+                "versions": versions,
+                "current_installed": _get_local_installed_version(name),
+            }, ensure_ascii=False)
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
 

@@ -12,6 +12,8 @@ skills 通过 MCP 协议暴露给任何支持 MCP 的 agent（Hermes / Claude Co
 |------|------|
 | `list_skills` | 列出能力中心所有可用 skills（含远程版本、本地已安装版本、是否可升级） |
 | `get_skill` | 获取某个 skill 的完整 SKILL.md 内容（+ 元信息） |
+| `get_skill_changelog` | 获取某个 skill 的 CHANGELOG.md 内容和解析后的版本历史 |
+| `list_skill_versions` | 列出某个 skill 的所有历史版本（从 CHANGELOG.md 解析） |
 | `install_skill` | 把 skill（含 `dependencies` 硬依赖）安装到本地 skills 目录（目录由 `SKILLS_HUB_INSTALL_DIR` 指定） |
 | `upgrade_skill` | 升级已安装的 skill 到最新版本（强制重新拉取并覆盖本地） |
 | `refresh_cache` | 重新拉取远端仓库索引（本地缓存失效时用） |
