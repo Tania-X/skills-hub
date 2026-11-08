@@ -39,6 +39,7 @@ LOCAL_REPO = os.environ.get("SKILLS_HUB_LOCAL_REPO", "")  # 本地克隆路径�
 CACHE_TTL = int(os.environ.get("SKILLS_HUB_CACHE_TTL", "300"))
 PROXY = os.environ.get("SKILLS_HUB_PROXY", "")  # 如 http://127.0.0.1:7890（可选）
 GITHUB_TOKEN = os.environ.get("SKILLS_HUB_TOKEN", os.environ.get("GITHUB_TOKEN", ""))
+API_KEY = os.environ.get("SKILLS_HUB_API_KEY", "")  # HTTP模式认证（可选，设置后客户端需带 Authorization: Bearer xxx）
 
 
 def default_install_dir() -> str:
@@ -169,6 +170,78 @@ def _parse_frontmatter(text: str) -> dict:
             key, _, value = line.partition(":")
             meta[key.strip()] = value.strip().strip('"').strip("'")
     return meta
+
+
+def _parse_changelog(text: str) -> list[dict]:
+    """解析 CHANGELOG.md，返回版本历史列表（按时间倒序）。
+
+    格式约定：
+    ## v1.2.3 - 2024-01-15
+    ### 新增
+    - xxx
+    ### 修复
+    - yyy
+    """
+    versions: list[dict] = []
+    current: dict | None = None
+
+    for line in text.splitlines():
+        line = line.strip()
+        # 匹配版本标题：## v1.2.3 - 2024-01-15
+        if line.startswith("## "):
+            if current:
+                versions.append(current)
+            # 解析版本号和日期
+            header = line[3:].strip()
+            parts = header.split(" - ", 1)
+            version = parts[0].strip().lstrip("vV")
+            date = parts[1].strip() if len(parts) > 1 else ""
+            current = {"version": version, "date": date, "changes": []}
+        # 匹配变更条目：- xxx
+        elif current and line.startswith("- "):
+            current["changes"].append(line[2:].strip())
+
+    if current:
+        versions.append(current)
+
+    return versions
+
+
+def _get_skill_changelog(name: str) -> dict:
+    """获取某个 skill 的 CHANGELOG.md 内容和解析后的版本历史。"""
+    _validate_skill_name(name)
+
+    # 1) 本地副本优先
+    if LOCAL_REPO:
+        p = Path(LOCAL_REPO) / "skills" / name / "CHANGELOG.md"
+        if p.is_file():
+            text = p.read_text(encoding="utf-8", errors="replace")
+            return {
+                "name": name,
+                "content": text,
+                "versions": _parse_changelog(text),
+                "source": "local",
+            }
+
+    # 2) GitHub 兜底
+    try:
+        import base64
+        text = _gh_request(f"{API_BASE}/contents/skills/{name}/CHANGELOG.md?ref={BRANCH}")
+        content = base64.b64decode(text["content"]).decode("utf-8", errors="replace")
+        return {
+            "name": name,
+            "content": content,
+            "versions": _parse_changelog(content),
+            "source": "github",
+        }
+    except Exception as e:  # noqa: BLE001
+        return {
+            "name": name,
+            "content": "",
+            "versions": [],
+            "source": "none",
+            "message": f"该 skill 没有 CHANGELOG.md: {e}",
+        }
 
 
 def get_skills_index(force: bool = False) -> list[dict]:
@@ -381,13 +454,27 @@ def _install_with_deps(name: str, force: bool, with_deps: bool) -> dict:
 
 # ---------------------------------------------------------------- MCP 工具
 
+def _get_local_installed_version(name: str) -> str:
+    """读取本地已安装 skill 的版本号（从 SKILL.md frontmatter 解析）。"""
+    target = Path(INSTALL_DIR) / name / "SKILL.md"
+    if not target.is_file():
+        return ""
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+        meta = _parse_frontmatter(text)
+        return meta.get("version", "")
+    except Exception:
+        return ""
+
+
 def _make_mcp():
     from fastmcp import FastMCP
 
     mcp = FastMCP("skills-hub", instructions=(
         "能力中心 MCP 服务器：管理可复用的 agent skills（Hermes / Claude Code 等）。"
         "支持多版本共存：同一个skill可以安装多个版本，随时切换。"
-        "可用工具：list_skills 列出 skills；get_skill 读取内容；"
+        "可用工具：list_skills 列出 skills（含本地已安装版本）；get_skill 读取内容；"
+        "get_skill_changelog 查看版本历史；list_skill_versions 列出所有版本；"
         "list_installed_versions 查看本地已安装版本；use_version 切换默认版本；"
         "install_skill 安装；upgrade_skill 升级；downgrade_skill 降级；"
         "refresh_cache 重新同步索引。"
@@ -395,9 +482,16 @@ def _make_mcp():
 
     @mcp.tool()
     def list_skills() -> str:
-        """列出能力中心所有可用 skills 及其描述、版本。"""
+        """列出能力中心所有可用 skills 及其描述、远程版本、本地已安装版本。"""
         try:
             skills = get_skills_index()
+            # 补充本地已安装版本
+            for s in skills:
+                local_ver = _get_local_installed_version(s["name"])
+                s["local_version"] = local_ver
+                s["upgradable"] = bool(
+                    local_ver and s.get("version") and s["version"] != local_ver
+                )
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
         return json.dumps({"skills": skills}, ensure_ascii=False)
@@ -437,6 +531,61 @@ def _make_mcp():
         try:
             skills = get_skills_index(force=True)
             return json.dumps({"ok": True, "count": len(skills), "skills": skills}, ensure_ascii=False)
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def upgrade_skill(name: str, with_deps: bool = True) -> str:
+        """升级已安装的 skill 到最新版本（强制重新拉取并覆盖本地）。
+
+        Args:
+            name: skill 名称
+            with_deps: 是否同时升级依赖（默认 True）
+        """
+        try:
+            local_ver = _get_local_installed_version(name)
+            result = _install_with_deps(name, force=True, with_deps=with_deps)
+            result["previous_version"] = local_ver
+            result["current_version"] = ""
+            # 获取最新版本号
+            try:
+                data = get_skill_content(name, force=True)
+                result["current_version"] = data.get("version", "")
+            except RuntimeError:
+                pass
+            return json.dumps(result, ensure_ascii=False)
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def get_skill_changelog(name: str) -> str:
+        """获取某个 skill 的 CHANGELOG.md 内容和解析后的版本历史。
+
+        Args:
+            name: skill 名称
+        """
+        try:
+            data = _get_skill_changelog(name)
+            return json.dumps(data, ensure_ascii=False)
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def list_skill_versions(name: str) -> str:
+        """列出某个 skill 的所有历史版本（从 CHANGELOG.md 解析）。
+
+        Args:
+            name: skill 名称
+        """
+        try:
+            data = _get_skill_changelog(name)
+            versions = data.get("versions", [])
+            return json.dumps({
+                "name": name,
+                "count": len(versions),
+                "versions": versions,
+                "current_installed": _get_local_installed_version(name),
+            }, ensure_ascii=False)
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
 
@@ -504,7 +653,56 @@ def main() -> None:
 
     mcp = _make_mcp()
     if args.transport == "http":
-        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+        # HTTP 模式：加认证中间件 + 健康检查端点
+        import asyncio
+        from starlette.applications import Starlette
+        from starlette.responses import JSONResponse
+        from starlette.routing import Route, Mount
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.requests import Request
+
+        # API Key 认证中间件
+        class APIKeyMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request: Request, call_next):
+                # 健康检查端点不需要认证
+                if request.url.path == "/health":
+                    return await call_next(request)
+                # 如果设置了 API Key，校验请求头
+                if API_KEY:
+                    auth = request.headers.get("authorization", "")
+                    if not auth.startswith("Bearer ") or auth[7:] != API_KEY:
+                        return JSONResponse(
+                            {"error": "unauthorized", "detail": "Invalid or missing API key"},
+                            status_code=401,
+                        )
+                return await call_next(request)
+
+        # 健康检查端点
+        async def health_endpoint(request: Request):
+            return JSONResponse({
+                "status": "ok",
+                "service": "skills-hub-mcp",
+                "auth_enabled": bool(API_KEY),
+                "repo": REPO,
+                "branch": BRANCH,
+            })
+
+        # 获取 MCP 的 ASGI 应用
+        mcp_app = mcp.http_app(transport="streamable-http")
+
+        # 组合 Starlette 应用（注意：必须传入 mcp_app.lifespan）
+        app = Starlette(
+            routes=[
+                Route("/health", health_endpoint),
+                Mount("/", app=mcp_app),
+            ],
+            lifespan=mcp_app.lifespan,
+        )
+        app.add_middleware(APIKeyMiddleware)
+
+        # 启动服务
+        import uvicorn
+        uvicorn.run(app, host=args.host, port=args.port)
     else:
         mcp.run(transport="stdio")
 
