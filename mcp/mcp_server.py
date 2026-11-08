@@ -242,23 +242,106 @@ def _parse_deps(meta: dict) -> list[str]:
 
 
 def _install_one(name: str, force: bool) -> dict:
-    """安装单个 skill（无依赖），返回安装结果。force=True 保证安装时拉取最新内容。"""
+    """安装单个 skill（无依赖），返回安装结果。force=True 保证安装时拉取最新内容。
+
+    多版本共存模式：安装到 <name>@<version>/ 目录，软链接指向默认版本。
+    """
     _validate_skill_name(name)
     data = get_skill_content(name, force=True)
-    target = Path(INSTALL_DIR) / name
+    version = data.get("version", "latest")
+    versioned_dir_name = f"{name}@{version}"
+
+    target = Path(INSTALL_DIR) / versioned_dir_name
     if target.exists() and not force:
         return {
             "name": name,
             "status": "skipped",
             "reason": f"已存在于 {target}（force=True 覆盖）",
+            "version": version,
         }
     target.mkdir(parents=True, exist_ok=True)
     (target / "SKILL.md").write_text(data["content"], encoding="utf-8")
+
+    # 创建/更新软链接指向默认版本
+    link_path = Path(INSTALL_DIR) / name
+    try:
+        if link_path.is_symlink() or link_path.exists():
+            if link_path.is_symlink():
+                link_path.unlink()
+            elif link_path.is_dir():
+                # 旧格式（无版本号目录），备份一下
+                import shutil
+                backup = link_path.parent / f"{name}.legacy"
+                if not backup.exists():
+                    shutil.move(str(link_path), str(backup))
+        # Windows 需要管理员权限或开发者模式，失败就跳过
+        link_path.symlink_to(versioned_dir_name, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        # Windows 不支持软链接，跳过（不影响安装）
+        pass
+
     return {
         "name": name,
         "status": "installed",
         "installed_to": str(target),
-        "version": data.get("version", ""),
+        "version": version,
+    }
+
+
+def _list_installed_versions(name: str) -> list[dict]:
+    """列出本地已安装的某个skill的所有版本。"""
+    _validate_skill_name(name)
+    install_dir = Path(INSTALL_DIR)
+    if not install_dir.is_dir():
+        return []
+
+    versions = []
+    for child in sorted(install_dir.iterdir()):
+        # 匹配 <name>@<version> 格式
+        if child.is_dir() and child.name.startswith(f"{name}@"):
+            version = child.name[len(name) + 1:]
+            skill_md = child / "SKILL.md"
+            has_content = skill_md.is_file()
+            versions.append({
+                "version": version,
+                "path": str(child),
+                "installed": has_content,
+            })
+
+    # 检查默认软链接指向哪个版本
+    link_path = install_dir / name
+    current = ""
+    if link_path.is_symlink():
+        current = link_path.resolve().name[len(name) + 1:] if link_path.resolve().name.startswith(f"{name}@") else link_path.resolve().name
+
+    return {
+        "name": name,
+        "current_default": current,
+        "versions": versions,
+        "count": len(versions),
+    }
+
+
+def _use_version(name: str, version: str) -> dict:
+    """切换默认使用的版本（更新软链接）。"""
+    _validate_skill_name(name)
+    versioned_dir_name = f"{name}@{version}"
+    target = Path(INSTALL_DIR) / versioned_dir_name
+    if not target.is_dir():
+        raise RuntimeError(f"版本 {version} 未安装，已安装的版本用 list_installed_versions 查看")
+
+    link_path = Path(INSTALL_DIR) / name
+    try:
+        if link_path.exists() or link_path.is_symlink():
+            link_path.unlink()
+        link_path.symlink_to(versioned_dir_name, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        raise RuntimeError("Windows 不支持软链接，请手动切换目录")
+
+    return {
+        "name": name,
+        "switched_to": version,
+        "path": str(target),
     }
 
 
@@ -303,9 +386,11 @@ def _make_mcp():
 
     mcp = FastMCP("skills-hub", instructions=(
         "能力中心 MCP 服务器：管理可复用的 agent skills（Hermes / Claude Code 等）。"
+        "支持多版本共存：同一个skill可以安装多个版本，随时切换。"
         "可用工具：list_skills 列出 skills；get_skill 读取内容；"
-        "install_skill 安装到本地 skills 目录（目录由 SKILLS_HUB_INSTALL_DIR 指定，"
-        "Hermes 默认 $HERMES_HOME/skills，Claude Code 设为 ~/.claude/skills）。"
+        "list_installed_versions 查看本地已安装版本；use_version 切换默认版本；"
+        "install_skill 安装；upgrade_skill 升级；downgrade_skill 降级；"
+        "refresh_cache 重新同步索引。"
     ))
 
     @mcp.tool()
@@ -352,6 +437,56 @@ def _make_mcp():
         try:
             skills = get_skills_index(force=True)
             return json.dumps({"ok": True, "count": len(skills), "skills": skills}, ensure_ascii=False)
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def list_installed_versions(name: str) -> str:
+        """列出本地已安装的某个skill的所有版本（多版本共存）。
+
+        Args:
+            name: skill 名称
+        """
+        try:
+            data = _list_installed_versions(name)
+            return json.dumps(data, ensure_ascii=False)
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def use_version(name: str, version: str) -> str:
+        """切换默认使用的版本（更新软链接指向指定版本）。
+
+        Args:
+            name: skill 名称
+            version: 要切换到的版本号，如 "3.0.0"
+        """
+        try:
+            data = _use_version(name, version)
+            return json.dumps(data, ensure_ascii=False)
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def downgrade_skill(name: str, version: str = "") -> str:
+        """降级已安装的 skill 到指定版本。
+
+        Args:
+            name: skill 名称
+            version: 要降级到的版本号（为空则回退到上一个稳定版）
+        """
+        try:
+            if not version:
+                # 自动回退到上一个版本（按版本号排序，取倒数第二个）
+                installed = _list_installed_versions(name)
+                versions = [v["version"] for v in installed.get("versions", [])]
+                if len(versions) < 2:
+                    return json.dumps({"error": "没有可回退的旧版本"})
+                version = versions[-2]  # 倒数第二个就是上一个版本
+
+            result = _use_version(name, version)
+            result["action"] = "downgrade"
+            return json.dumps(result, ensure_ascii=False)
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
 
