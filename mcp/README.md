@@ -10,9 +10,10 @@ skills 通过 MCP 协议暴露给任何支持 MCP 的 agent（Hermes / Claude Co
 
 | 工具 | 说明 |
 |------|------|
-| `list_skills` | 列出能力中心所有可用 skills |
+| `list_skills` | 列出能力中心所有可用 skills（含远程版本、本地已安装版本、是否可升级） |
 | `get_skill` | 获取某个 skill 的完整 SKILL.md 内容（+ 元信息） |
 | `install_skill` | 把 skill（含 `dependencies` 硬依赖）安装到本地 skills 目录（目录由 `SKILLS_HUB_INSTALL_DIR` 指定） |
+| `upgrade_skill` | 升级已安装的 skill 到最新版本（强制重新拉取并覆盖本地） |
 | `refresh_cache` | 重新拉取远端仓库索引（本地缓存失效时用） |
 
 > **依赖语义**：frontmatter 的 `dependencies`（列表或逗号分隔字符串）是**硬依赖**，
@@ -54,15 +55,26 @@ claude mcp add skills-hub --env SKILLS_HUB_INSTALL_DIR="$HOME/.claude/skills" --
 ### HTTP（远程共享）
 
 ```bash
+# 启动远程服务（带 API Key 认证）
+export SKILLS_HUB_API_KEY="your-secret-key-here"
 python mcp_server.py --transport http --host 0.0.0.0 --port 8910
-# Hermes:
+
+# 健康检查（无需认证）
+curl http://localhost:8910/health
+# {"status":"ok","service":"skills-hub-mcp","auth_enabled":true,...}
+
+# Hermes 客户端连接（带认证）
 mcp_servers:
   skills_hub:
-    url: "http://localhost:8910/mcp"
+    url: "http://your-server:8910/mcp"
+    headers:
+      Authorization: "Bearer your-secret-key-here"
 ```
 
-> ⚠️ HTTP 模式**没有内置认证**，且 server 可读/可写本地 skills 目录——只应在可信内网使用，
-> 或前面加 basic_auth 反代（参考 `skills/hermes-gateway-deploy` 的双重认证做法）。
+> **安全说明**：
+> - 设置 `SKILLS_HUB_API_KEY` 环境变量后，所有 `/mcp` 端点需要带 `Authorization: Bearer <key>` 请求头
+> - `/health` 端点无需认证，可用于负载均衡健康检查
+> - 生产环境建议前面再加一层 HTTPS 反代（Nginx/Caddy）
 
 ## 环境变量
 
@@ -75,6 +87,7 @@ mcp_servers:
 | `SKILLS_HUB_CACHE_TTL` | `300` | 索引与内容缓存秒数（`refresh_cache` 同时清空两者；`install_skill` 始终拉取最新内容） |
 | `SKILLS_HUB_PROXY` | 空 | GitHub API 代理，如 `http://127.0.0.1:7890` |
 | `SKILLS_HUB_TOKEN` / `GITHUB_TOKEN` | 空 | GitHub API Token（提高限流配额） |
+| `SKILLS_HUB_API_KEY` | 空 | HTTP 模式认证密钥（设置后客户端需带 `Authorization: Bearer <key>` 请求头） |
 
 ## 与仓库关系
 
