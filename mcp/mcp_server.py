@@ -473,11 +473,13 @@ def _make_mcp():
     mcp = FastMCP("skills-hub", instructions=(
         "能力中心 MCP 服务器：管理可复用的 agent skills（Hermes / Claude Code 等）。"
         "支持多版本共存：同一个skill可以安装多个版本，随时切换。"
-        "可用工具：list_skills 列出 skills（含本地已安装版本）；get_skill 读取内容；"
+        "三大能力：Tools（工具调用）、Prompts（消息模板）、Resources（待实现）。"
+        "可用工具：list_skills 列出 skills；get_skill 读取内容；"
         "get_skill_changelog 查看版本历史；list_skill_versions 列出所有版本；"
         "list_installed_versions 查看本地已安装版本；use_version 切换默认版本；"
         "install_skill 安装；upgrade_skill 升级；downgrade_skill 降级；"
         "refresh_cache 重新同步索引。"
+        "可用Prompt模板：code_review（代码审查）、pr_description（PR描述）、skill_usage_guide（技能使用指南）。"
     ))
 
     @mcp.tool()
@@ -638,6 +640,94 @@ def _make_mcp():
             return json.dumps(result, ensure_ascii=False)
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
+
+    # ----------------------------------------------------------------
+    # Prompts（MCP标准三大能力之一：预定义消息模板）
+    # ----------------------------------------------------------------
+
+    @mcp.prompt()
+    def code_review(code_snippet: str, focus_area: str = "全部") -> str:
+        """生成代码审查prompt模板。
+
+        Args:
+            code_snippet: 要审查的代码片段
+            focus_area: 审查重点（全部/性能/安全/可读性/错误处理）
+        """
+        focus_map = {
+            "全部": "全面审查：性能、安全、可读性、错误处理、边界情况",
+            "性能": "重点关注：时间复杂度、空间复杂度、I/O效率、缓存使用",
+            "安全": "重点关注：SQL注入、XSS、路径穿越、敏感信息泄露、权限校验",
+            "可读性": "重点关注：命名规范、代码结构、注释完整性、函数长度",
+            "错误处理": "重点关注：异常捕获边界、错误信息完整性、资源释放、边界条件",
+        }
+        focus_text = focus_map.get(focus_area, focus_area)
+
+        return f"""请作为资深工程师，对以下代码进行代码审查。
+
+审查重点：{focus_text}
+
+代码片段：
+```
+{code_snippet}
+```
+
+请按以下格式输出审查结果：
+1. 严重问题（必须修复）
+2. 建议改进（推荐优化）
+3. 亮点（写得好的地方）
+"""
+
+    @mcp.prompt()
+    def pr_description(change_summary: str, test_coverage: str = "已覆盖核心场景") -> str:
+        """生成PR描述prompt模板。
+
+        Args:
+            change_summary: 改动概述（做了什么）
+            test_coverage: 测试覆盖情况
+        """
+        return f"""请根据以下改动信息，生成一个专业的Pull Request描述。
+
+改动概述：
+{change_summary}
+
+测试覆盖：
+{test_coverage}
+
+请按以下结构生成：
+## 改动说明
+（解决了什么问题，为什么要改）
+
+## 主要变更
+（列出关键改动点）
+
+## 测试验证
+（测试了什么，怎么验证的）
+
+## 影响范围
+（可能影响哪些功能，有没有 breaking change）
+"""
+
+    @mcp.prompt()
+    def skill_usage_guide(skill_name: str, task_description: str) -> str:
+        """生成技能使用指南prompt模板，告诉LLM怎么使用某个skill。
+
+        Args:
+            skill_name: 技能名称（如 pr-ai-review-loop）
+            task_description: 你要完成的任务描述
+        """
+        return f"""我需要使用技能 "{skill_name}" 来完成以下任务：
+
+任务描述：
+{task_description}
+
+请按以下步骤操作：
+1. 先调用 list_skills 确认技能存在和当前版本
+2. 调用 get_skill 读取技能完整内容
+3. 按照技能文档的指引完成任务
+4. 如果遇到问题，调用 get_skill_changelog 查看版本历史和已知问题
+
+请开始。
+"""
 
     return mcp
 
