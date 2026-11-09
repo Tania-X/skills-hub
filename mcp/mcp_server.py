@@ -473,13 +473,14 @@ def _make_mcp():
     mcp = FastMCP("skills-hub", instructions=(
         "能力中心 MCP 服务器：管理可复用的 agent skills（Hermes / Claude Code 等）。"
         "支持多版本共存：同一个skill可以安装多个版本，随时切换。"
-        "三大能力：Tools（工具调用）、Prompts（消息模板）、Resources（待实现）。"
+        "MCP三大核心能力全部实现：Tools（工具调用）、Prompts（消息模板）、Resources（数据资源）。"
         "可用工具：list_skills 列出 skills；get_skill 读取内容；"
         "get_skill_changelog 查看版本历史；list_skill_versions 列出所有版本；"
         "list_installed_versions 查看本地已安装版本；use_version 切换默认版本；"
         "install_skill 安装；upgrade_skill 升级；downgrade_skill 降级；"
         "refresh_cache 重新同步索引。"
         "可用Prompt模板：code_review（代码审查）、pr_description（PR描述）、skill_usage_guide（技能使用指南）。"
+        "可用Resources：skills://index（技能索引）、skill://{name}/SKILL.md（技能内容）、skill://{name}/CHANGELOG.md（版本历史）。"
     ))
 
     @mcp.tool()
@@ -728,6 +729,45 @@ def _make_mcp():
 
 请开始。
 """
+
+    # ----------------------------------------------------------------
+    # Resources（MCP标准三大能力之一：暴露数据给客户端）
+    # ----------------------------------------------------------------
+
+    @mcp.resource("skills://index")
+    def skills_index() -> str:
+        """所有可用skills的索引列表（名称、描述、版本）。"""
+        try:
+            skills = get_skills_index()
+            return json.dumps({"skills": skills}, ensure_ascii=False, indent=2)
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+    @mcp.resource("skill://{name}/SKILL.md")
+    def skill_content(name: str) -> str:
+        """某个skill的SKILL.md完整内容。
+
+        URI参数：name - skill名称（如 pr-ai-review-loop）
+        """
+        try:
+            data = get_skill_content(name)
+            return data["content"]
+        except RuntimeError as e:
+            return f"Error: {e}"
+
+    @mcp.resource("skill://{name}/CHANGELOG.md")
+    def skill_changelog(name: str) -> str:
+        """某个skill的CHANGELOG.md内容。
+
+        URI参数：name - skill名称
+        """
+        try:
+            data = _get_skill_changelog(name)
+            if data.get("raw_content"):
+                return data["raw_content"]
+            return json.dumps(data, ensure_ascii=False, indent=2)
+        except RuntimeError as e:
+            return f"Error: {e}"
 
     return mcp
 
