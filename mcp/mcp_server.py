@@ -41,6 +41,13 @@ PROXY = os.environ.get("SKILLS_HUB_PROXY", "")  # 如 http://127.0.0.1:7890（�
 GITHUB_TOKEN = os.environ.get("SKILLS_HUB_TOKEN", os.environ.get("GITHUB_TOKEN", ""))
 API_KEY = os.environ.get("SKILLS_HUB_API_KEY", "")  # HTTP模式认证（可选，设置后客户端需带 Authorization: Bearer xxx）
 
+# Redis（可选）：配置 SKILLS_HUB_REDIS_URL 后启用分布式缓存 + 限流计数；
+# 未配置 / 连接失败时自动降级到进程内内存，服务不可用性不受影响。
+REDIS_URL = os.environ.get("SKILLS_HUB_REDIS_URL", "")
+# 限流：每窗口允许的请求数与窗口秒数（按 API Key 计数）
+RATE_LIMIT = int(os.environ.get("SKILLS_HUB_RATE_LIMIT", "60"))
+RATE_WINDOW = int(os.environ.get("SKILLS_HUB_RATE_WINDOW", "60"))
+
 
 def default_install_dir() -> str:
     """Hermes skills 目录：$HERMES_HOME/skills，回退 ~/.hermes/skills"""
@@ -60,7 +67,154 @@ _cache: dict[str, Any] = {
     "fetched_at": 0.0,
     "contents": {},              # 内容缓存（get_skill，按 name）
     "contents_fetched_at": {},   # 各条内容的缓存时间
+    "changelogs": {},            # changelog 缓存（按 name）
+    "changelogs_fetched_at": {},
 }
+
+# ---------------------------------------------------------------- Redis 客户端 / 缓存降级 / 限流
+
+# redis-py 为可选依赖：未安装时整段降级到内存，不影响服务启动。
+try:
+    import redis as _redis_lib  # type: ignore
+    _REDIS_IMPORTABLE = True
+except ImportError:  # pragma: no cover - 依赖缺失场景
+    _redis_lib = None
+    _REDIS_IMPORTABLE = False
+
+_redis_client: Any = None
+_redis_state = "pending"  # pending / ok / disabled
+# 内存限流兜底计数：identity -> {window_index: count}
+_rate_memory: dict[str, dict[int, int]] = {}
+
+# 缓存 key 前缀（便于 refresh 时按前缀批量清理）
+KEY_INDEX = "skills:index"
+CONTENT_PREFIX = "skill:content:"
+CHANGELOG_PREFIX = "skill:changelog:"
+RATE_PREFIX = "rate:"
+
+
+def _content_key(name: str) -> str:
+    return f"{CONTENT_PREFIX}{name}"
+
+
+def _changelog_key(name: str) -> str:
+    return f"{CHANGELOG_PREFIX}{name}"
+
+
+def _get_redis() -> Any:
+    """惰性获取 Redis 客户端。
+
+    - 未配置 REDIS_URL / 包未安装 / 连接失败 -> 返回 None（降级内存）；
+    - 连接成功后复用单例；任何一次探测失败都记为 disabled，避免每次请求都重试拖慢响应。
+    """
+    global _redis_client, _redis_state
+    if not REDIS_URL or not _REDIS_IMPORTABLE:
+        _redis_state = "disabled"
+        return None
+    if _redis_state == "disabled":
+        return None
+    if _redis_state == "ok":
+        return _redis_client
+    try:
+        client = _redis_lib.Redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            protocol=2,  # Redis 5.x 不支持 RESP3 的 HELLO 握手
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+        client.ping()
+        _redis_client = client
+        _redis_state = "ok"
+        return client
+    except Exception:  # noqa: BLE001
+        _redis_client = None
+        _redis_state = "disabled"
+        return None
+
+
+def _redis_get(key: str) -> str | None:
+    """读 Redis；未连接或异常返回 None（调用方回退内存）。"""
+    client = _get_redis()
+    if client is None:
+        return None
+    try:
+        return client.get(key)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _redis_set(key: str, value: str, ttl: int) -> None:
+    """写 Redis 带 TTL；异常静默忽略（缓存失败不影响主流程）。"""
+    client = _get_redis()
+    if client is None:
+        return
+    try:
+        client.set(key, value, ex=ttl)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _redis_delete(key: str) -> None:
+    client = _get_redis()
+    if client is None:
+        return
+    try:
+        client.delete(key)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _redis_flush_prefix(prefix: str) -> None:
+    """按前缀删除 Redis 中的缓存键（refresh_cache 用）。"""
+    client = _get_redis()
+    if client is None:
+        return
+    try:
+        for k in client.scan_iter(match=f"{prefix}*"):
+            client.delete(k)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def check_rate_limit(identity: str) -> dict:
+    """固定窗口限流：按 identity（API Key 或匿名标识）在窗口内计数。
+
+    优先 Redis INCR + EXPIRE 做分布式计数；Redis 不可用时降级进程内内存计数器。
+    返回 {"allowed", "count", "limit", "retry_after", "backend"}。
+    """
+    window = int(time.time() // RATE_WINDOW)
+    client = _get_redis()
+    if client is not None:
+        try:
+            key = f"{RATE_PREFIX}{identity}:{window}"
+            count = client.incr(key)
+            if count == 1:
+                client.expire(key, RATE_WINDOW)
+            allowed = count <= RATE_LIMIT
+            return {
+                "allowed": allowed,
+                "count": int(count),
+                "limit": RATE_LIMIT,
+                "retry_after": RATE_WINDOW if not allowed else 0,
+                "backend": "redis",
+            }
+        except Exception:  # noqa: BLE001 - Redis 异常时降级内存
+            pass
+
+    # 内存兜底：清理上一窗口，避免字典无限增长
+    bucket = _rate_memory.setdefault(identity, {})
+    bucket.pop(window - 1, None)
+    count = bucket.get(window, 0) + 1
+    bucket[window] = count
+    allowed = count <= RATE_LIMIT
+    return {
+        "allowed": allowed,
+        "count": count,
+        "limit": RATE_LIMIT,
+        "retry_after": RATE_WINDOW if not allowed else 0,
+        "backend": "memory",
+    }
 
 # ---------------------------------------------------------------- 名称校验
 
@@ -208,32 +362,55 @@ def _parse_changelog(text: str) -> list[dict]:
 
 
 def _get_skill_changelog(name: str) -> dict:
-    """获取某个 skill 的 CHANGELOG.md 内容和解析后的版本历史。"""
+    """获取某个 skill 的 CHANGELOG.md 内容和解析后的版本历史（带 TTL 缓存）。"""
     _validate_skill_name(name)
+    now = time.time()
+    key = _changelog_key(name)
 
-    # 1) 本地副本优先
+    # 1) Redis 优先
+    raw = _redis_get(key)
+    if raw is not None:
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            pass
+
+    # 2) 内存兜底
+    cached = _cache["changelogs"].get(name)
+    if cached and (now - _cache["changelogs_fetched_at"].get(name, 0.0)) < CACHE_TTL:
+        return cached
+
+    # 3) 本地副本优先
     if LOCAL_REPO:
         p = Path(LOCAL_REPO) / "skills" / name / "CHANGELOG.md"
         if p.is_file():
             text = p.read_text(encoding="utf-8", errors="replace")
-            return {
+            result = {
                 "name": name,
                 "content": text,
                 "versions": _parse_changelog(text),
                 "source": "local",
             }
+            _cache["changelogs"][name] = result
+            _cache["changelogs_fetched_at"][name] = now
+            _redis_set(key, json.dumps(result, ensure_ascii=False), CACHE_TTL)
+            return result
 
-    # 2) GitHub 兜底
+    # 4) GitHub 兜底
     try:
         import base64
         text = _gh_request(f"{API_BASE}/contents/skills/{name}/CHANGELOG.md?ref={BRANCH}")
         content = base64.b64decode(text["content"]).decode("utf-8", errors="replace")
-        return {
+        result = {
             "name": name,
             "content": content,
             "versions": _parse_changelog(content),
             "source": "github",
         }
+        _cache["changelogs"][name] = result
+        _cache["changelogs_fetched_at"][name] = now
+        _redis_set(key, json.dumps(result, ensure_ascii=False), CACHE_TTL)
+        return result
     except Exception as e:  # noqa: BLE001
         return {
             "name": name,
@@ -245,14 +422,34 @@ def _get_skill_changelog(name: str) -> dict:
 
 
 def get_skills_index(force: bool = False) -> list[dict]:
-    """获取 skills 索引（带缓存）。force=True 时同时清空内容缓存。"""
+    """获取 skills 索引（带缓存）。force=True 时同时清空内容缓存与 Redis 缓存。
+
+    缓存顺序：Redis -> 进程内内存 -> 本地副本 / GitHub 重新拉取。
+    """
     now = time.time()
     if force:
         _cache["contents"].clear()
         _cache["contents_fetched_at"].clear()
+        _cache["changelogs"].clear()
+        _cache["changelogs_fetched_at"].clear()
+        _redis_delete(KEY_INDEX)
+        _redis_flush_prefix(CONTENT_PREFIX)
+        _redis_flush_prefix(CHANGELOG_PREFIX)
+
+    # 1) Redis 优先
+    if not force:
+        raw = _redis_get(KEY_INDEX)
+        if raw is not None:
+            try:
+                return json.loads(raw)
+            except (ValueError, TypeError):
+                pass  # 序列化异常则回退内存 / 重新拉取
+
+    # 2) 内存兜底
     if not force and _cache["skills"] and (now - _cache["fetched_at"]) < CACHE_TTL:
         return _cache["skills"]
 
+    # 3) 本地副本优先，GitHub 兜底
     skills = _local_skills()
     if skills is None:
         try:
@@ -262,18 +459,35 @@ def get_skills_index(force: bool = False) -> list[dict]:
 
     _cache["skills"] = skills
     _cache["fetched_at"] = now
+    _redis_set(KEY_INDEX, json.dumps(skills, ensure_ascii=False), CACHE_TTL)
     return skills
 
 
 def get_skill_content(name: str, force: bool = False) -> dict:
-    """获取单个 skill 的完整内容（带 TTL 缓存；force=True 强制重新拉取并回写缓存）。"""
+    """获取单个 skill 的完整内容（带 TTL 缓存；force=True 强制重新拉取并回写缓存）。
+
+    缓存顺序：Redis -> 进程内内存 -> 本地副本 / GitHub 重新拉取。
+    """
     _validate_skill_name(name)
     now = time.time()
+    key = _content_key(name)
+
+    # 1) Redis 优先
+    if not force:
+        raw = _redis_get(key)
+        if raw is not None:
+            try:
+                return json.loads(raw)
+            except (ValueError, TypeError):
+                pass
+
+    # 2) 内存兜底
     if not force:
         cached = _cache["contents"].get(name)
         if cached and (now - _cache["contents_fetched_at"].get(name, 0.0)) < CACHE_TTL:
             return cached
-    # 1) 本地副本优先
+
+    # 3) 本地副本优先
     if LOCAL_REPO:
         p = Path(LOCAL_REPO) / "skills" / name / "SKILL.md"
         if p.is_file():
@@ -282,8 +496,9 @@ def get_skill_content(name: str, force: bool = False) -> dict:
             result = {"name": name, "content": text, "version": meta.get("version", ""), "source": "local"}
             _cache["contents"][name] = result
             _cache["contents_fetched_at"][name] = now
+            _redis_set(key, json.dumps(result, ensure_ascii=False), CACHE_TTL)
             return result
-    # 2) GitHub 兜底
+    # 4) GitHub 兜底
     try:
         import base64
         text = _gh_request(f"{API_BASE}/contents/skills/{name}/SKILL.md?ref={BRANCH}")
@@ -292,6 +507,7 @@ def get_skill_content(name: str, force: bool = False) -> dict:
         result = {"name": name, "content": content, "version": meta.get("version", ""), "source": "github"}
         _cache["contents"][name] = result
         _cache["contents_fetched_at"][name] = now
+        _redis_set(key, json.dumps(result, ensure_ascii=False), CACHE_TTL)
         return result
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"无法获取 skill '{name}': {e}") from e
@@ -791,13 +1007,15 @@ def main() -> None:
         from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.requests import Request
 
-        # API Key 认证中间件
+        # API Key 认证 + 限流中间件
         class APIKeyMiddleware(BaseHTTPMiddleware):
             async def dispatch(self, request: Request, call_next):
-                # 健康检查端点不需要认证
+                # 健康检查端点既不认证也不限流
                 if request.url.path == "/health":
                     return await call_next(request)
-                # 如果设置了 API Key，校验请求头
+
+                # ---- 认证 ----
+                identity = "anonymous"
                 if API_KEY:
                     auth = request.headers.get("authorization", "")
                     if not auth.startswith("Bearer ") or auth[7:] != API_KEY:
@@ -805,6 +1023,26 @@ def main() -> None:
                             {"error": "unauthorized", "detail": "Invalid or missing API key"},
                             status_code=401,
                         )
+                    identity = auth[7:]  # 通过认证后，按 API Key 作为限流身份
+                else:
+                    # 未配置 API_KEY（单租户/内网模式）：用可选的租户头标识，否则匿名
+                    identity = request.headers.get("x-tenant-id", "anonymous")
+
+                # ---- 限流（按身份固定窗口；Redis 不可用时自动降级内存计数）----
+                limit = check_rate_limit(identity)
+                if not limit["allowed"]:
+                    return JSONResponse(
+                        {
+                            "error": "rate_limit_exceeded",
+                            "detail": f"超过限流阈值：每 {RATE_WINDOW}s 最多 {RATE_LIMIT} 次",
+                            "count": limit["count"],
+                            "limit": limit["limit"],
+                            "backend": limit["backend"],
+                        },
+                        status_code=429,
+                        headers={"Retry-After": str(limit["retry_after"])},
+                    )
+
                 return await call_next(request)
 
         # 健康检查端点
@@ -815,6 +1053,9 @@ def main() -> None:
                 "auth_enabled": bool(API_KEY),
                 "repo": REPO,
                 "branch": BRANCH,
+                "redis_configured": bool(REDIS_URL),
+                "rate_limit": RATE_LIMIT,
+                "rate_window": RATE_WINDOW,
             })
 
         # 获取 MCP 的 ASGI 应用

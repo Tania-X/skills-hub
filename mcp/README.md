@@ -28,8 +28,10 @@ skills 通过 MCP 协议暴露给任何支持 MCP 的 agent（Hermes / Claude Co
 ## 依赖要求
 
 ```bash
-pip install "mcp>=1.26,<2" fastmcp
+pip install "mcp>=1.26,<2" fastmcp redis
 ```
+
+> `redis` 为**可选依赖**：未安装或未配置连接串时，缓存与限流自动降级到进程内内存，服务照常运行。
 
 > ⚠️ **mcp 包版本约束**：Hermes 0.19 兼容 `mcp==1.26.x`；**mcp 2.x 改了 API 名
 > （`streamable_http_client`），Hermes 会报 `streamable_http is not available`**。
@@ -78,6 +80,19 @@ mcp_servers:
 > - `/health` 端点无需认证，可用于负载均衡健康检查
 > - 生产环境建议前面再加一层 HTTPS 反代（Nginx/Caddy）
 
+## 缓存与限流
+
+- **缓存层**：索引、单条 skill 内容、changelog 都带 TTL 缓存。配置 `SKILLS_HUB_REDIS_URL` 后走 Redis 分布式缓存（多实例共享、重启不丢）；**Redis 不可用时自动降级到进程内内存字典**，缓存故障不会拖垮服务。`refresh_cache` 会同时清空 Redis 与内存中的索引 / 内容 / changelog 缓存。
+- **限流层**：HTTP 模式按身份（API Key；未配 API Key 时按匿名 / `x-tenant-id`）做**固定窗口限流**，用 Redis `INCR + EXPIRE` 计数，超阈值返回 `429`（带 `Retry-After`）；Redis 不可用时降级为进程内内存计数器。`/health` 不限流。
+
+```bash
+# 可选：启用 Redis（不配置则纯内存降级）
+export SKILLS_HUB_REDIS_URL="redis://127.0.0.1:6379/0"
+# 限流阈值与窗口（默认 60 次 / 60 秒）
+export SKILLS_HUB_RATE_LIMIT="60"
+export SKILLS_HUB_RATE_WINDOW="60"
+```
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
@@ -90,6 +105,9 @@ mcp_servers:
 | `SKILLS_HUB_PROXY` | 空 | GitHub API 代理，如 `http://127.0.0.1:7890` |
 | `SKILLS_HUB_TOKEN` / `GITHUB_TOKEN` | 空 | GitHub API Token（提高限流配额） |
 | `SKILLS_HUB_API_KEY` | 空 | HTTP 模式认证密钥（设置后客户端需带 `Authorization: Bearer <key>` 请求头） |
+| `SKILLS_HUB_REDIS_URL` | 空 | Redis 连接串（可选，如 `redis://127.0.0.1:6379/0`）；未配置或连接失败时降级内存缓存 / 内存限流 |
+| `SKILLS_HUB_RATE_LIMIT` | `60` | 限流阈值：每个身份在一个窗口内允许的最大请求数 |
+| `SKILLS_HUB_RATE_WINDOW` | `60` | 限流窗口秒数（固定窗口） |
 
 ## 与仓库关系
 

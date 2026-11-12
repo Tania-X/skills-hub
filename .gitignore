@@ -12,4 +12,9 @@ Thumbs.db
 
 .git.bak-*
 
-# ���ز�����ʱĿ¼.tmp-*
+# Redis 持久化文件（本地 Redis 数据，不入库）
+*.rdb
+*.rdb-*
+appendonly.aof
+
+# ���ز�����ʱĿ¼.tmp-*
